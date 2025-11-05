@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/rumma-core",
+    "crates/rumma-kernels",
+    "crates/rumma-runtime",
+    "crates/rumma-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+thiserror = "1"
+anyhow = "1"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }

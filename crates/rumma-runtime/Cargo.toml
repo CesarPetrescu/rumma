@@ -1,0 +1,11 @@
+[package]
+name = "rumma-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rumma-core = { path = "../rumma-core" }
+rumma-kernels = { path = "../rumma-kernels" }
+anyhow.workspace = true
+thiserror.workspace = true
+parking_lot = "0.12"
