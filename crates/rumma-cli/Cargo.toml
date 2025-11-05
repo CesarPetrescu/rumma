@@ -1,0 +1,12 @@
+[package]
+name = "rumma-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rumma-runtime = { path = "../rumma-runtime" }
+rumma-core = { path = "../rumma-core" }
+anyhow.workspace = true
+clap.workspace = true
+rand.workspace = true
+indicatif = "0.17"
