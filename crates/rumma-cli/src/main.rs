@@ -1,25 +1,41 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, ValueHint};
+use dirs::cache_dir;
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
-use rumma_core::{ModelBuilder, QuantizationConfig};
+use rumma_core::{load_awq_model, Model, ModelBuilder, QuantizationConfig};
 use rumma_runtime::Engine;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "rumma demo CLI", long_about = None)]
 struct Args {
-    #[arg(long, default_value_t = 4096)]
+    #[arg(
+        long,
+        default_value_t = 4096,
+        help = "Hidden size for the random demo model"
+    )]
     hidden_size: usize,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Number of layers for the random demo model"
+    )]
     layers: usize,
 
-    #[arg(long, default_value_t = 128)]
+    #[arg(
+        long,
+        default_value_t = 128,
+        help = "Quantization group size for the random demo model"
+    )]
     group_size: usize,
 
     #[arg(long, default_value_t = 1)]
@@ -30,17 +46,101 @@ struct Args {
 
     #[arg(long, default_value_t = 42)]
     seed: u64,
+
+    #[arg(
+        long,
+        value_hint = ValueHint::FilePath,
+        conflicts_with_all = ["hf_repo", "random"],
+        help = "Path to an AWQ safetensors checkpoint"
+    )]
+    model: Option<PathBuf>,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["model", "random"],
+        help = "Hugging Face repo id containing an AWQ checkpoint"
+    )]
+    hf_repo: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "random",
+        help = "Revision to download from the Hugging Face repo (default: main)"
+    )]
+    revision: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "random",
+        help = "File to download from the Hugging Face repo (default: model.safetensors)"
+    )]
+    hf_file: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "random",
+        help = "Token for private Hugging Face repositories"
+    )]
+    hf_token: Option<String>,
+
+    #[arg(long, value_hint = ValueHint::DirPath, help = "Override the Hugging Face cache directory")]
+    cache_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Force using the random demo model even if a checkpoint is provided"
+    )]
+    random: bool,
+}
+
+enum ModelSelection {
+    Random,
+    Awq { path: PathBuf, origin: String },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let quant_cfg = QuantizationConfig {
-        group_size: args.group_size,
-        symmetric: true,
-        nibble_map: [0, 1, 2, 3, 4, 5, 6, 7],
+    let selection = resolve_model_selection(&args)?;
+
+    let (model, hidden_size, depth, origin, awq_layers) = match selection {
+        ModelSelection::Random => {
+            let quant_cfg = QuantizationConfig {
+                group_size: args.group_size,
+                symmetric: true,
+                nibble_map: [0, 1, 2, 3, 4, 5, 6, 7],
+            };
+            let builder = ModelBuilder::new(args.hidden_size, args.layers, quant_cfg);
+            let model = builder.build_random(args.seed)?;
+            (
+                Arc::new(model),
+                args.hidden_size,
+                args.layers,
+                String::from("random demo weights"),
+                Vec::new(),
+            )
+        }
+        ModelSelection::Awq { path, origin } => {
+            let (model, hidden, depth, layer_names) = build_awq_model(&path)?;
+            (
+                Arc::new(model),
+                hidden,
+                depth,
+                format!("{origin} ({})", path.display()),
+                layer_names,
+            )
+        }
     };
-    let builder = ModelBuilder::new(args.hidden_size, args.layers, quant_cfg);
-    let model = Arc::new(builder.build_random(args.seed)?);
+
+    println!(
+        "Loaded model: hidden_size={} layers={} source={}",
+        hidden_size, depth, origin
+    );
+    if !awq_layers.is_empty() {
+        for name in &awq_layers {
+            println!("  layer {name}");
+        }
+    }
+
     let mut engine = Engine::new(model.clone());
     engine.capture_decode_graph();
 
@@ -50,7 +150,7 @@ fn main() -> Result<()> {
     };
 
     let mut rng = StdRng::seed_from_u64(args.seed + 1);
-    let mut prefill_inputs = vec![0f32; args.batch * args.hidden_size];
+    let mut prefill_inputs = vec![0f32; args.batch * hidden_size];
     for value in prefill_inputs.iter_mut() {
         *value = rng.gen_range(-1.0..1.0);
     }
@@ -60,7 +160,7 @@ fn main() -> Result<()> {
 
     println!(
         "Prefill complete: batch={} hidden={} layers={} duration={:.2?}",
-        args.batch, args.hidden_size, args.layers, prefill_duration
+        args.batch, hidden_size, depth, prefill_duration
     );
 
     let mut next_inputs: HashMap<u64, Vec<f32>> = batch_handle
@@ -109,4 +209,82 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_model_selection(args: &Args) -> Result<ModelSelection> {
+    if args.random {
+        return Ok(ModelSelection::Random);
+    }
+
+    if let Some(path) = &args.model {
+        return Ok(ModelSelection::Awq {
+            path: path.clone(),
+            origin: String::from("local checkpoint"),
+        });
+    }
+
+    if let Some(repo_id) = &args.hf_repo {
+        let (path, origin) = download_hf_checkpoint(repo_id, args)?;
+        return Ok(ModelSelection::Awq { path, origin });
+    }
+
+    Ok(ModelSelection::Random)
+}
+
+fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
+    let awq = load_awq_model(path)?;
+    let hidden_size = awq
+        .hidden_size()
+        .ok_or_else(|| anyhow!("AWQ checkpoint {path:?} did not contain any layers"))?;
+    let depth = awq.depth();
+    let layer_names = awq
+        .layers()
+        .iter()
+        .map(|layer| layer.name.clone())
+        .collect::<Vec<_>>();
+    let quant_layers = awq.into_quantized_layers();
+    let builder = ModelBuilder::new(hidden_size, depth, QuantizationConfig::default());
+    let model = builder.build_from_quantized_layers(quant_layers)?;
+    Ok((model, hidden_size, depth, layer_names))
+}
+
+fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String)> {
+    let revision = args
+        .revision
+        .clone()
+        .unwrap_or_else(|| String::from("main"));
+    let filename = args
+        .hf_file
+        .clone()
+        .unwrap_or_else(|| String::from("model.safetensors"));
+
+    let cache = resolve_cache_dir(args)?;
+    fs::create_dir_all(&cache)
+        .with_context(|| format!("failed to create Hugging Face cache at {:?}", cache))?;
+
+    let mut builder = ApiBuilder::new();
+    if let Some(token) = args.hf_token.clone() {
+        builder = builder.with_token(Some(token));
+    }
+    builder = builder.with_cache_dir(cache.clone());
+    let api = builder.build()?;
+
+    let repo = api.repo(Repo::with_revision(
+        repo_id.to_string(),
+        RepoType::Model,
+        revision.clone(),
+    ));
+    let path = repo.get(&filename)?;
+    let origin = format!("{repo_id}/{filename}@{revision}");
+    Ok((path, origin))
+}
+
+fn resolve_cache_dir(args: &Args) -> Result<PathBuf> {
+    if let Some(dir) = &args.cache_dir {
+        return Ok(dir.clone());
+    }
+    if let Some(base) = cache_dir() {
+        return Ok(base.join("rumma").join("checkpoints"));
+    }
+    Ok(std::env::temp_dir().join("rumma-checkpoints"))
 }
