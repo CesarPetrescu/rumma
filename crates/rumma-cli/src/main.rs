@@ -49,11 +49,16 @@ struct Args {
 
     #[arg(
         long,
-        value_hint = ValueHint::FilePath,
-        conflicts_with_all = ["hf_repo", "random"],
-        help = "Path to an AWQ safetensors checkpoint"
+        help = "Context size (for informational purposes)"
     )]
-    model: Option<PathBuf>,
+    ctx: Option<usize>,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["hf_repo", "random"],
+        help = "Path to an AWQ safetensors checkpoint or HuggingFace model URL"
+    )]
+    model: Option<String>,
 
     #[arg(
         long,
@@ -138,10 +143,15 @@ fn main() -> Result<()> {
         }
     };
 
-    println!(
+    print!(
         "Loaded model: hidden_size={} layers={} source={}",
         hidden_size, depth, origin
     );
+    if let Some(ctx) = args.ctx {
+        println!(" ctx={}", ctx);
+    } else {
+        println!();
+    }
     if !awq_layers.is_empty() {
         for name in &awq_layers {
             println!("  layer {name}");
@@ -223,11 +233,18 @@ fn resolve_model_selection(args: &Args) -> Result<ModelSelection> {
         return Ok(ModelSelection::Random);
     }
 
-    if let Some(path) = &args.model {
-        return Ok(ModelSelection::Awq {
-            path: path.clone(),
-            origin: String::from("local checkpoint"),
-        });
+    if let Some(model_arg) = &args.model {
+        // Check if it's a HuggingFace URL
+        if let Some(repo_id) = parse_huggingface_url(model_arg) {
+            let (path, origin) = download_hf_checkpoint(&repo_id, args)?;
+            return Ok(ModelSelection::Awq { path, origin });
+        } else {
+            // Treat as file path
+            return Ok(ModelSelection::Awq {
+                path: PathBuf::from(model_arg),
+                origin: String::from("local checkpoint"),
+            });
+        }
     }
 
     if let Some(repo_id) = &args.hf_repo {
@@ -236,6 +253,33 @@ fn resolve_model_selection(args: &Args) -> Result<ModelSelection> {
     }
 
     Ok(ModelSelection::Random)
+}
+
+/// Parse a HuggingFace URL and extract the repo ID
+/// Examples:
+///   https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-AWQ -> Some("Qwen/Qwen2.5-3B-Instruct-AWQ")
+///   https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-AWQ/tree/main -> Some("Qwen/Qwen2.5-3B-Instruct-AWQ")
+///   /path/to/model.safetensors -> None
+fn parse_huggingface_url(s: &str) -> Option<String> {
+    if !s.starts_with("http://") && !s.starts_with("https://") {
+        return None;
+    }
+
+    // Parse URL to extract repo ID
+    if let Some(url_path) = s.strip_prefix("https://huggingface.co/")
+                              .or_else(|| s.strip_prefix("http://huggingface.co/")) {
+        // Extract the repo ID (org/model-name)
+        // Handle cases like:
+        //   Qwen/Qwen2.5-3B-Instruct-AWQ
+        //   Qwen/Qwen2.5-3B-Instruct-AWQ/tree/main
+        //   Qwen/Qwen2.5-3B-Instruct-AWQ/resolve/main/model.safetensors
+        let parts: Vec<&str> = url_path.split('/').collect();
+        if parts.len() >= 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]));
+        }
+    }
+
+    None
 }
 
 fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
