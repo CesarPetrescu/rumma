@@ -312,8 +312,8 @@ fn parse_huggingface_url(s: &str) -> Option<String> {
 
 fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
     let awq = load_awq_model(path)?;
-    let depth = awq.depth();
-    let layer_names = awq
+    let total_layers = awq.depth();
+    let all_layer_names = awq
         .layers()
         .iter()
         .map(|layer| layer.name.clone())
@@ -323,12 +323,32 @@ fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
     let hidden_size = awq.hidden_size()
         .context("failed to determine hidden_size from AWQ model")?;
 
-    let quant_layers = awq.into_quantized_layers();
+    // Filter layers to only include those that can be chained sequentially
+    // (i.e., layers where input dimension matches hidden_size)
+    // This allows the Engine to process AWQ models even though they contain
+    // layers with different dimensions that aren't meant to be chained.
+    let awq_layers = awq.into_layers();
+    let mut filtered_layers = Vec::new();
+    let mut filtered_names = Vec::new();
+
+    for layer in awq_layers {
+        if layer.linear.cols() == hidden_size {
+            filtered_names.push(layer.name.clone());
+            filtered_layers.push(layer.linear);
+        }
+    }
+
+    eprintln!("   Filtered to {} chainable layers (from {} total)",
+              filtered_layers.len(), total_layers);
+
+    if filtered_layers.is_empty() {
+        bail!("no layers with input dimension matching hidden_size={}", hidden_size);
+    }
 
     // Create model with explicit hidden_size (AWQ models cannot infer this from layer dims)
-    let model = Model::with_hidden_size(quant_layers, hidden_size)?;
+    let model = Model::with_hidden_size(filtered_layers, hidden_size)?;
 
-    Ok((model, hidden_size, depth, layer_names))
+    Ok((model, hidden_size, total_layers, all_layer_names))
 }
 
 fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String)> {
