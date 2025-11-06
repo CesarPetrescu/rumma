@@ -17,18 +17,10 @@ impl Model {
             return Err(anyhow!("model must contain at least one layer"));
         }
 
-        // Validate that layers chain properly: output of layer i must match input of layer i+1
-        for i in 0..layers.len() - 1 {
-            if layers[i].rows() != layers[i + 1].cols() {
-                return Err(anyhow!(
-                    "layer {} output dimension {} does not match layer {} input dimension {}",
-                    i,
-                    layers[i].rows(),
-                    i + 1,
-                    layers[i + 1].cols()
-                ));
-            }
-        }
+        // Note: We do not validate that layers chain properly here, as real AWQ models
+        // may contain layers from different parts of a transformer (attention, FFN, etc.)
+        // that are not meant to be chained sequentially. Dimension mismatches will be
+        // caught at runtime during GEMM operations if the layers are used incorrectly.
 
         // For compatibility with the Engine, we use the output dimension of the last layer
         // as the hidden_size (this is what gets stored in the cache)

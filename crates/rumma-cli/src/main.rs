@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueHint};
 use dirs::cache_dir;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
