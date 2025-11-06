@@ -40,6 +40,30 @@ impl AwqModel {
     }
 
     pub fn hidden_size(&self) -> Option<usize> {
+        // For transformer models, we need to find the actual hidden_size by looking at
+        // specific layer types. The layers are stored in alphabetical order, so we can't
+        // just use the first layer.
+        //
+        // Strategy: Look for attention q_proj, k_proj, or v_proj layers, which take
+        // hidden_size as input. Or look for down_proj layers which output hidden_size.
+        for layer in &self.layers {
+            if layer.name.contains(".q_proj")
+                || layer.name.contains(".k_proj")
+                || layer.name.contains(".v_proj") {
+                // These layers take hidden_size as input
+                return Some(layer.linear.cols());
+            }
+        }
+
+        // Fallback: look for down_proj which outputs hidden_size
+        for layer in &self.layers {
+            if layer.name.contains(".down_proj") {
+                // down_proj outputs hidden_size
+                return Some(layer.linear.rows());
+            }
+        }
+
+        // Last resort: use the first layer's input dimension
         self.layers.first().map(|layer| layer.linear.cols())
     }
 
