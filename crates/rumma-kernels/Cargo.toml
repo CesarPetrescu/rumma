@@ -3,7 +3,16 @@ name = "rumma-kernels"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+# CUDA version features - user must select one when enabling cuda
+cuda-12 = ["cuda", "cudarc/cuda-12060"]
+cuda-11 = ["cuda", "cudarc/cuda-11080"]
+
 [dependencies]
 rumma-core = { path = "../rumma-core" }
 rayon = "1.8"
 anyhow.workspace = true
+cudarc = { version = "0.12", features = ["cublas", "f16"], optional = true }
