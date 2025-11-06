@@ -324,15 +324,17 @@ fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
         .context("failed to determine hidden_size from AWQ model")?;
 
     // Filter layers to only include those that can be chained sequentially
-    // (i.e., layers where input dimension matches hidden_size)
+    // (i.e., layers where BOTH input and output dimensions match hidden_size)
     // This allows the Engine to process AWQ models even though they contain
     // layers with different dimensions that aren't meant to be chained.
+    // We filter out MLP layers (gate_proj, up_proj, down_proj) which have
+    // intermediate_size dimensions, keeping only attention projections.
     let awq_layers = awq.into_layers();
     let mut filtered_layers = Vec::new();
     let mut filtered_names = Vec::new();
 
     for layer in awq_layers {
-        if layer.linear.cols() == hidden_size {
+        if layer.linear.cols() == hidden_size && layer.linear.rows() == hidden_size {
             filtered_names.push(layer.name.clone());
             filtered_layers.push(layer.linear);
         }
