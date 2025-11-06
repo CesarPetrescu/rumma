@@ -325,8 +325,8 @@ fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
 
     let quant_layers = awq.into_quantized_layers();
 
-    // Create model directly without ModelBuilder (which is designed for square test models)
-    let model = Model::new(quant_layers)?;
+    // Create model with explicit hidden_size (AWQ models cannot infer this from layer dims)
+    let model = Model::with_hidden_size(quant_layers, hidden_size)?;
 
     Ok((model, hidden_size, depth, layer_names))
 }

@@ -32,6 +32,20 @@ impl Model {
         })
     }
 
+    /// Creates a Model with an explicitly specified hidden_size.
+    /// This is useful for AWQ models where the hidden_size cannot be reliably
+    /// inferred from the layer dimensions alone.
+    pub fn with_hidden_size(layers: Vec<QuantizedLinear>, hidden_size: usize) -> Result<Self> {
+        if layers.is_empty() {
+            return Err(anyhow!("model must contain at least one layer"));
+        }
+
+        Ok(Self {
+            layers: Arc::new(layers),
+            hidden_size,
+        })
+    }
+
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
     }
