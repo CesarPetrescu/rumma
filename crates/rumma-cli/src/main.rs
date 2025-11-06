@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,6 +11,7 @@ use dirs::cache_dir;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use tokenizers::Tokenizer;
 
 use rumma_core::{load_awq_model, Model, ModelBuilder, QuantizationConfig};
 use rumma_runtime::Engine;
@@ -103,18 +105,24 @@ struct Args {
         help = "Force using the random demo model even if a checkpoint is provided"
     )]
     random: bool,
+
+    #[arg(
+        long,
+        help = "Enter interactive chat mode instead of running benchmark"
+    )]
+    interactive: bool,
 }
 
 enum ModelSelection {
     Random,
-    Awq { path: PathBuf, origin: String },
+    Awq { path: PathBuf, origin: String, repo_id: Option<String> },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let selection = resolve_model_selection(&args)?;
 
-    let (model, hidden_size, depth, origin, awq_layers) = match selection {
+    let (model, hidden_size, depth, origin, awq_layers, repo_id) = match selection {
         ModelSelection::Random => {
             let quant_cfg = QuantizationConfig {
                 group_size: args.group_size,
@@ -129,9 +137,10 @@ fn main() -> Result<()> {
                 args.layers,
                 String::from("random demo weights"),
                 Vec::new(),
+                None,
             )
         }
-        ModelSelection::Awq { path, origin } => {
+        ModelSelection::Awq { path, origin, repo_id } => {
             let (model, hidden, depth, layer_names) = build_awq_model(&path)?;
             (
                 Arc::new(model),
@@ -139,6 +148,7 @@ fn main() -> Result<()> {
                 depth,
                 format!("{origin} ({})", path.display()),
                 layer_names,
+                repo_id,
             )
         }
     };
@@ -155,6 +165,21 @@ fn main() -> Result<()> {
     if !awq_layers.is_empty() {
         for name in &awq_layers {
             println!("  layer {name}");
+        }
+    }
+
+    // Handle interactive mode
+    if args.interactive {
+        if let Some(repo) = repo_id {
+            println!("\n🤖 Entering interactive chat mode...\n");
+
+            // Download tokenizer
+            let tokenizer = download_tokenizer(&repo, &args)?;
+
+            run_interactive_mode(model, hidden_size, &tokenizer)?;
+            return Ok(());
+        } else {
+            bail!("Interactive mode requires a HuggingFace model (use --model with a HuggingFace URL)");
         }
     }
 
@@ -237,19 +262,20 @@ fn resolve_model_selection(args: &Args) -> Result<ModelSelection> {
         // Check if it's a HuggingFace URL
         if let Some(repo_id) = parse_huggingface_url(model_arg) {
             let (path, origin) = download_hf_checkpoint(&repo_id, args)?;
-            return Ok(ModelSelection::Awq { path, origin });
+            return Ok(ModelSelection::Awq { path, origin, repo_id: Some(repo_id) });
         } else {
             // Treat as file path
             return Ok(ModelSelection::Awq {
                 path: PathBuf::from(model_arg),
                 origin: String::from("local checkpoint"),
+                repo_id: None,
             });
         }
     }
 
     if let Some(repo_id) = &args.hf_repo {
         let (path, origin) = download_hf_checkpoint(repo_id, args)?;
-        return Ok(ModelSelection::Awq { path, origin });
+        return Ok(ModelSelection::Awq { path, origin, repo_id: Some(repo_id.clone()) });
     }
 
     Ok(ModelSelection::Random)
@@ -313,6 +339,9 @@ fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String
         .clone()
         .unwrap_or_else(|| String::from("model.safetensors"));
 
+    println!("📦 Downloading from HuggingFace: {}/{}", repo_id, filename);
+    println!("   Revision: {}", revision);
+
     let cache = resolve_cache_dir(args)?;
     fs::create_dir_all(&cache)
         .with_context(|| format!("failed to create Hugging Face cache at {:?}", cache))?;
@@ -328,8 +357,10 @@ fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String
     let repo = api.repo(repo_spec.clone());
 
     if args.hf_download_repo {
+        println!("   Downloading entire repository...");
         let info = repo.info()?;
         for sibling in &info.siblings {
+            println!("   Fetching: {}", sibling.rfilename);
             repo.get(&sibling.rfilename)?;
         }
 
@@ -342,12 +373,130 @@ fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String
             bail!("{repo_id} revision {revision} did not contain expected file {filename}");
         }
         let origin = format!("{repo_id}@{revision} (full repo)");
+        println!("✓ Download complete\n");
         Ok((full_path, origin))
     } else {
+        println!("   Fetching model file...");
         let path = repo.get(&filename)?;
         let origin = format!("{repo_id}/{filename}@{revision}");
+        println!("✓ Download complete\n");
         Ok((path, origin))
     }
+}
+
+fn download_tokenizer(repo_id: &str, args: &Args) -> Result<Tokenizer> {
+    let revision = args
+        .revision
+        .clone()
+        .unwrap_or_else(|| String::from("main"));
+
+    println!("📝 Downloading tokenizer from HuggingFace: {}", repo_id);
+
+    let cache = resolve_cache_dir(args)?;
+    let mut builder = ApiBuilder::new();
+    if let Some(token) = args.hf_token.clone() {
+        builder = builder.with_token(Some(token));
+    }
+    builder = builder.with_cache_dir(cache);
+    let api = builder.build()?;
+
+    let repo_spec = Repo::with_revision(repo_id.to_string(), RepoType::Model, revision.clone());
+    let repo = api.repo(repo_spec);
+
+    let tokenizer_path = repo.get("tokenizer.json")?;
+    println!("✓ Tokenizer download complete\n");
+
+    Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {}", e))
+}
+
+fn run_interactive_mode(model: Arc<Model>, hidden_size: usize, tokenizer: &Tokenizer) -> Result<()> {
+    let layer_count = model.layers().len();
+
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  Welcome to Rumma Interactive Chat!");
+    println!("═══════════════════════════════════════════════════════════");
+    println!();
+    println!("Type your message and press Enter to chat.");
+    println!("Type 'quit' or 'exit' to leave.\n");
+    println!("Model: hidden_size={} layers={}", hidden_size, layer_count);
+    println!("═══════════════════════════════════════════════════════════\n");
+
+    let mut engine = Engine::new(model);
+    engine.capture_decode_graph();
+
+    loop {
+        // Show prompt
+        print!("You: ");
+        io::stdout().flush()?;
+
+        // Read user input
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        // Check for exit commands
+        if input.is_empty() {
+            continue;
+        }
+        if input == "quit" || input == "exit" {
+            println!("\nGoodbye! 👋\n");
+            break;
+        }
+
+        // Tokenize input
+        let encoding = tokenizer
+            .encode(input, false)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {}", e))?;
+        let token_ids = encoding.get_ids();
+
+        println!("\n[DEBUG] Tokenized input:");
+        println!("  Tokens: {:?}", &token_ids[..token_ids.len().min(10)]);
+        println!("  Token count: {}", token_ids.len());
+
+        // Generate response
+        println!("\nAssistant: ");
+        let response = generate_response(&mut engine, hidden_size, layer_count, token_ids, tokenizer)?;
+        println!("{}\n", response);
+        println!("───────────────────────────────────────────────────────────\n");
+    }
+
+    Ok(())
+}
+
+fn generate_response(
+    _engine: &mut Engine,
+    _hidden_size: usize,
+    layer_count: usize,
+    input_tokens: &[u32],
+    _tokenizer: &Tokenizer,
+) -> Result<String> {
+    // NOTE: This is a simplified implementation that demonstrates the inference flow.
+    // A complete implementation would need:
+    // 1. Embedding layer to convert token_ids -> hidden states
+    // 2. LM head to convert final hidden states -> logits over vocabulary
+    // 3. Proper sampling strategy (temperature, top-k, top-p)
+
+    println!("[INFO] Running inference (simplified demonstration)...");
+    println!("[INFO] In a complete implementation, we would:");
+    println!("  1. Convert tokens to embeddings using the model's embedding layer");
+    println!("  2. Run the transformer layers (this is what rumma does)");
+    println!("  3. Convert final hidden states to vocabulary logits using LM head");
+    println!("  4. Sample tokens and decode back to text");
+    println!();
+    println!("[LIMITATION] The current rumma engine works with hidden states directly,");
+    println!("             not with embeddings and LM heads. These components need to be");
+    println!("             added to support full text generation.");
+    println!();
+
+    // For now, return a helpful message
+    Ok(format!(
+        "I received your input ({} tokens), but full text generation is not yet implemented.\n\
+         The rumma engine successfully processes tensor operations through {} transformer layers,\n\
+         but it needs embedding and LM head support for complete text-to-text inference.",
+        input_tokens.len(),
+        layer_count
+    ))
 }
 
 fn resolve_cache_dir(args: &Args) -> Result<PathBuf> {
