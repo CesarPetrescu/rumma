@@ -16,15 +16,24 @@ impl Model {
         if layers.is_empty() {
             return Err(anyhow!("model must contain at least one layer"));
         }
-        let hidden = layers[0].cols();
-        if !layers
-            .iter()
-            .all(|layer| layer.cols() == hidden && layer.rows() == hidden)
-        {
-            return Err(anyhow!(
-                "only square layers with uniform hidden size are supported in this demo"
-            ));
+
+        // Validate that layers chain properly: output of layer i must match input of layer i+1
+        for i in 0..layers.len() - 1 {
+            if layers[i].rows() != layers[i + 1].cols() {
+                return Err(anyhow!(
+                    "layer {} output dimension {} does not match layer {} input dimension {}",
+                    i,
+                    layers[i].rows(),
+                    i + 1,
+                    layers[i + 1].cols()
+                ));
+            }
         }
+
+        // For compatibility with the Engine, we use the output dimension of the last layer
+        // as the hidden_size (this is what gets stored in the cache)
+        let hidden = layers.last().unwrap().rows();
+
         Ok(Self {
             layers: Arc::new(layers),
             hidden_size: hidden,
@@ -104,15 +113,19 @@ impl ModelBuilder {
                 layers.len()
             ));
         }
-        if !layers
-            .iter()
-            .all(|layer| layer.cols() == self.hidden_size && layer.rows() == self.hidden_size)
-        {
-            return Err(anyhow!(
-                "quantized layers must all be square with size {}",
-                self.hidden_size
-            ));
+
+        // Validate that the model's output dimension matches the expected hidden_size
+        // This ensures compatibility with the test/benchmark setup
+        if let Some(last_layer) = layers.last() {
+            if last_layer.rows() != self.hidden_size {
+                return Err(anyhow!(
+                    "model output dimension {} does not match expected hidden_size {}",
+                    last_layer.rows(),
+                    self.hidden_size
+                ));
+            }
         }
+
         Model::new(layers)
     }
 }

@@ -284,9 +284,6 @@ fn parse_huggingface_url(s: &str) -> Option<String> {
 
 fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
     let awq = load_awq_model(path)?;
-    let hidden_size = awq
-        .hidden_size()
-        .ok_or_else(|| anyhow!("AWQ checkpoint {path:?} did not contain any layers"))?;
     let depth = awq.depth();
     let layer_names = awq
         .layers()
@@ -294,8 +291,11 @@ fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
         .map(|layer| layer.name.clone())
         .collect::<Vec<_>>();
     let quant_layers = awq.into_quantized_layers();
-    let builder = ModelBuilder::new(hidden_size, depth, QuantizationConfig::default());
-    let model = builder.build_from_quantized_layers(quant_layers)?;
+
+    // Create model directly without ModelBuilder (which is designed for square test models)
+    let model = Model::new(quant_layers)?;
+    let hidden_size = model.hidden_size();
+
     Ok((model, hidden_size, depth, layer_names))
 }
 
