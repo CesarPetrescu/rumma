@@ -78,7 +78,7 @@ impl ModelBuilder {
                 .map_err(|err| anyhow!("layer {}: {err}", idx))
             })
             .collect::<Result<Vec<_>>>()?;
-        Model::new(layers)
+        self.build_from_quantized_layers(layers)
     }
 
     pub fn build_random(&self, seed: u64) -> Result<Model> {
@@ -94,5 +94,25 @@ impl ModelBuilder {
             weights.push(layer);
         }
         self.build_from_weights(&weights)
+    }
+
+    pub fn build_from_quantized_layers(&self, layers: Vec<QuantizedLinear>) -> Result<Model> {
+        if layers.len() != self.depth {
+            return Err(anyhow!(
+                "expected {} layers, got {}",
+                self.depth,
+                layers.len()
+            ));
+        }
+        if !layers
+            .iter()
+            .all(|layer| layer.cols() == self.hidden_size && layer.rows() == self.hidden_size)
+        {
+            return Err(anyhow!(
+                "quantized layers must all be square with size {}",
+                self.hidden_size
+            ));
+        }
+        Model::new(layers)
     }
 }

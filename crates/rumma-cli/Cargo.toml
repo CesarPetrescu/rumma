@@ -10,3 +10,5 @@ anyhow.workspace = true
 clap.workspace = true
 rand.workspace = true
 indicatif = "0.17"
+hf-hub = "0.4"
+dirs = "5"
