@@ -1,8 +1,6 @@
+# Force git-based protocol for crates.io index (instead of sparse/https)
 [source.crates-io]
-replace-with = "rsproxy"
-
-[source.rsproxy]
-registry = "https://rsproxy.cn/crates.io-index"
+registry = "https://github.com/rust-lang/crates.io-index"
 
 [net]
 git-fetch-with-cli = true
