@@ -84,8 +84,11 @@ struct LayerEntry {
 }
 
 pub fn load_awq_model(path: &Path) -> Result<AwqModel> {
+    eprintln!("   Reading safetensors file...");
     let bytes =
         fs::read(path).with_context(|| format!("failed to read AWQ checkpoint at {:?}", path))?;
+
+    eprintln!("   Parsing model metadata...");
     let (_, metadata) =
         SafeTensors::read_metadata(&bytes).context("failed to parse safetensors header")?;
     let global_metadata = metadata.metadata().clone();
@@ -106,8 +109,15 @@ pub fn load_awq_model(path: &Path) -> Result<AwqModel> {
         bail!("no AWQ tensors were found in {:?}", path);
     }
 
+    eprintln!("   Processing {} quantized layers...", entries.len());
     let mut layers = Vec::new();
+    let total_layers = entries.len();
+    let mut processed = 0;
     for (base, entry) in entries {
+        processed += 1;
+        if processed % 10 == 0 || processed == total_layers {
+            eprintln!("   [{}/{}] Processing layers...", processed, total_layers);
+        }
         let qweight_name = entry
             .qweight
             .ok_or_else(|| anyhow!("layer {base} is missing qweight tensor"))?;

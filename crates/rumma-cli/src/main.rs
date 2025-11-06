@@ -141,7 +141,9 @@ fn main() -> Result<()> {
             )
         }
         ModelSelection::Awq { path, origin, repo_id } => {
+            println!("🔧 Loading model from disk...");
             let (model, hidden, depth, layer_names) = build_awq_model(&path)?;
+            println!("✓ Model loaded successfully\n");
             (
                 Arc::new(model),
                 hidden,
