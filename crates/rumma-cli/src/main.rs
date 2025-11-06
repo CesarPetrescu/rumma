@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueHint};
 use dirs::cache_dir;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
@@ -82,6 +82,13 @@ struct Args {
         help = "Token for private Hugging Face repositories"
     )]
     hf_token: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "random",
+        help = "Download the entire Hugging Face repo instead of a single file"
+    )]
+    hf_download_repo: bool,
 
     #[arg(long, value_hint = ValueHint::DirPath, help = "Override the Hugging Face cache directory")]
     cache_dir: Option<PathBuf>,
@@ -269,14 +276,30 @@ fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String
     builder = builder.with_cache_dir(cache.clone());
     let api = builder.build()?;
 
-    let repo = api.repo(Repo::with_revision(
-        repo_id.to_string(),
-        RepoType::Model,
-        revision.clone(),
-    ));
-    let path = repo.get(&filename)?;
-    let origin = format!("{repo_id}/{filename}@{revision}");
-    Ok((path, origin))
+    let repo_spec = Repo::with_revision(repo_id.to_string(), RepoType::Model, revision.clone());
+    let repo = api.repo(repo_spec.clone());
+
+    if args.hf_download_repo {
+        let info = repo.info()?;
+        for sibling in &info.siblings {
+            repo.get(&sibling.rfilename)?;
+        }
+
+        let repo_dir = cache
+            .join(repo_spec.folder_name())
+            .join("snapshots")
+            .join(&info.sha);
+        let full_path = repo_dir.join(&filename);
+        if !full_path.exists() {
+            bail!("{repo_id} revision {revision} did not contain expected file {filename}");
+        }
+        let origin = format!("{repo_id}@{revision} (full repo)");
+        Ok((full_path, origin))
+    } else {
+        let path = repo.get(&filename)?;
+        let origin = format!("{repo_id}/{filename}@{revision}");
+        Ok((path, origin))
+    }
 }
 
 fn resolve_cache_dir(args: &Args) -> Result<PathBuf> {

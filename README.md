@@ -25,4 +25,5 @@ cargo run -p rumma-cli -- --hf-repo my-org/my-model --hf-file model.safetensors 
 ```
 
 Use `--hf-token` if the repository is private and `--cache-dir` to override the
-default cache location.
+default cache location. Pass `--hf-download-repo` to eagerly fetch the entire
+repository before loading the checkpoint.
