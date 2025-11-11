@@ -16,6 +16,9 @@ use tokenizers::Tokenizer;
 use rumma_core::{load_awq_model, Model, ModelBuilder, QuantizationConfig};
 use rumma_runtime::Engine;
 
+#[cfg(feature = "gui")]
+mod gui;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "rumma demo CLI", long_about = None)]
 struct Args {
@@ -111,6 +114,9 @@ struct Args {
         help = "Enter interactive chat mode instead of running benchmark"
     )]
     interactive: bool,
+
+    #[arg(long, help = "Launch the application in GUI mode")]
+    gui: bool,
 }
 
 enum ModelSelection {
@@ -122,8 +128,54 @@ enum ModelSelection {
     },
 }
 
+#[cfg(feature = "gui")]
+use std::sync::mpsc;
+
+#[cfg(feature = "gui")]
+pub fn resolve_and_load_model(
+    repo_id: &str,
+    status_tx: Option<mpsc::Sender<gui::GuiMessage>>,
+) -> Result<Model> {
+    // This function will be a stripped-down version of the CLI's model loading
+    // It needs to be callable from the GUI thread.
+
+    let mut args = Args::parse_from(Vec::<String>::new());
+    args.hf_repo = Some(repo_id.to_string());
+
+    let selection = resolve_model_selection(&args)?;
+
+    let model = match selection {
+        ModelSelection::Random => {
+            bail!("Random model not supported in GUI mode");
+        }
+        ModelSelection::Awq { paths, .. } => {
+            if let Some(tx) = &status_tx {
+                tx.send(gui::GuiMessage::Status("Loading model from disk...".to_string()))
+                    .unwrap();
+            }
+            let (model, _, _, _) = build_awq_model(&paths)?;
+            if let Some(tx) = &status_tx {
+                tx.send(gui::GuiMessage::Status(
+                    "Model loaded successfully.".to_string(),
+                ))
+                .unwrap();
+            }
+            model
+        }
+    };
+    Ok(model)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.gui {
+        #[cfg(feature = "gui")]
+        return gui::run().map_err(|e| anyhow::anyhow!("GUI Error: {}", e));
+        #[cfg(not(feature = "gui"))]
+        bail!("GUI feature is not enabled.");
+    }
+
     let selection = resolve_model_selection(&args)?;
 
     let (model, hidden_size, depth, origin, awq_layers, repo_id) = match selection {
