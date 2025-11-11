@@ -1,16 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use half::f16;
 use safetensors::tensor::TensorView;
 use safetensors::{Dtype, SafeTensors};
-use serde_json::Value;
+
+use serde::Deserialize;
 
 use crate::quant::{QuantizationConfig, QuantizedLinear};
 
 const AWQ_NIBBLE_MAP: [u8; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+
+#[derive(Debug, Deserialize)]
+struct QuantizationConfigMetadata {
+    w_bit: usize,
+    q_group_size: usize,
+    zero_point: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct AwqLayer {
@@ -83,30 +91,65 @@ struct LayerEntry {
     scales: Option<String>,
 }
 
-pub fn load_awq_model(path: &Path) -> Result<AwqModel> {
-    eprintln!("   Reading safetensors file...");
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read AWQ checkpoint at {:?}", path))?;
+pub fn load_awq_model(paths: &[PathBuf]) -> Result<AwqModel> {
+    if paths.is_empty() {
+        bail!("no safetensors files provided");
+    }
 
-    eprintln!("   Parsing model metadata...");
-    let (_, metadata) =
-        SafeTensors::read_metadata(&bytes).context("failed to parse safetensors header")?;
-    let global_metadata = metadata.metadata().clone();
-    let tensors = SafeTensors::deserialize(&bytes).context("failed to parse safetensors file")?;
+    // Read all files into memory first to manage lifetimes
+    let mut loaded_data = Vec::new();
+    for path in paths {
+        let bytes =
+            fs::read(path).with_context(|| format!("failed to read AWQ checkpoint at {:?}", path))?;
+        loaded_data.push(bytes);
+    }
 
     let mut entries: BTreeMap<String, LayerEntry> = BTreeMap::new();
-    for name in tensors.names() {
-        if let Some(prefix) = name.strip_suffix(".qweight") {
-            entries.entry(prefix.to_string()).or_default().qweight = Some(name.to_string());
-        } else if let Some(prefix) = name.strip_suffix(".qzeros") {
-            entries.entry(prefix.to_string()).or_default().qzeros = Some(name.to_string());
-        } else if let Some(prefix) = name.strip_suffix(".scales") {
-            entries.entry(prefix.to_string()).or_default().scales = Some(name.to_string());
+    let mut global_metadata: HashMap<String, String> = HashMap::new();
+    let mut tensors_map: HashMap<String, TensorView> = HashMap::new();
+    let mut loaded_tensors = Vec::new();
+
+    // Read metadata and deserialize tensors from each file
+    for (i, bytes) in loaded_data.iter().enumerate() {
+        eprintln!("   Parsing safetensors file ({}/{})", i + 1, paths.len());
+
+        // Read metadata from the file bytes
+        let (_, file_metadata) = SafeTensors::read_metadata(bytes)
+            .with_context(|| format!("failed to parse header of {:?}", paths[i]))?;
+        if let Some(meta_map) = file_metadata.metadata() {
+            for (key, value) in meta_map {
+                global_metadata
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+
+        // Deserialize the full tensor set
+        let tensors = SafeTensors::deserialize(bytes)
+            .with_context(|| format!("failed to parse safetensors file {:?}", paths[i]))?;
+
+        // Find all the quantized layer components
+        for name in tensors.names() {
+            if let Some(prefix) = name.strip_suffix(".qweight") {
+                entries.entry(prefix.to_string()).or_default().qweight = Some(name.to_string());
+            } else if let Some(prefix) = name.strip_suffix(".qzeros") {
+                entries.entry(prefix.to_string()).or_default().qzeros = Some(name.to_string());
+            } else if let Some(prefix) = name.strip_suffix(".scales") {
+                entries.entry(prefix.to_string()).or_default().scales = Some(name.to_string());
+            }
+        }
+
+        loaded_tensors.push(tensors);
+    }
+
+    for tensors in &loaded_tensors {
+        for name in tensors.names() {
+            tensors_map.insert(name.to_string(), tensors.tensor(&name)?);
         }
     }
 
     if entries.is_empty() {
-        bail!("no AWQ tensors were found in {:?}", path);
+        bail!("no AWQ tensors were found in the provided files");
     }
 
     eprintln!("   Processing {} quantized layers...", entries.len());
@@ -125,16 +168,16 @@ pub fn load_awq_model(path: &Path) -> Result<AwqModel> {
             .scales
             .ok_or_else(|| anyhow!("layer {base} is missing scales tensor"))?;
 
-        let qweight_tensor = tensors
-            .tensor(&qweight_name)
+        let qweight_tensor = tensors_map
+            .get(&qweight_name)
             .with_context(|| format!("tensor {qweight_name} was missing from file"))?;
-        let scales_tensor = tensors
-            .tensor(&scales_name)
+        let scales_tensor = tensors_map
+            .get(&scales_name)
             .with_context(|| format!("tensor {scales_name} was missing from file"))?;
         let qzeros_tensor = match entry.qzeros {
             Some(name) => Some(
-                tensors
-                    .tensor(&name)
+                tensors_map
+                    .get(&name)
                     .with_context(|| format!("tensor {name} was missing from file"))?,
             ),
             None => None,
@@ -142,10 +185,10 @@ pub fn load_awq_model(path: &Path) -> Result<AwqModel> {
 
         let quantized = build_layer(
             &base,
-            &qweight_tensor,
-            qzeros_tensor.as_ref(),
-            &scales_tensor,
-            global_metadata.as_ref(),
+            qweight_tensor,
+            qzeros_tensor,
+            scales_tensor,
+            Some(&global_metadata),
         )?;
         layers.push(AwqLayer {
             name: base,
@@ -213,14 +256,28 @@ fn build_layer(
         bail!("{name}: scales tensor has zero rows");
     }
 
-    let group_size = if rows % scale_rows == 0 {
-        rows / scale_rows
-    } else {
-        bail!(
-            "{name}: in_features {} is not divisible by scales rows {}",
-            rows,
-            scale_rows
+    let quant_config_keys = ["quantization_config", "quant_config"];
+    let quant_metadata = metadata
+        .and_then(|meta| search_for_metadata::<QuantizationConfigMetadata>(meta, &quant_config_keys))
+        .transpose()?;
+
+    let (group_size, symmetric) = if let Some(meta) = quant_metadata {
+        eprintln!(
+            "    - Found quantization config: w_bit={}, group_size={}, zero_point={}",
+            meta.w_bit, meta.q_group_size, meta.zero_point
         );
+        (meta.q_group_size, !meta.zero_point)
+    } else {
+        let group_size = if rows % scale_rows == 0 {
+            rows / scale_rows
+        } else {
+            bail!(
+                "{name}: in_features {} is not divisible by scales rows {}",
+                rows,
+                scale_rows
+            );
+        };
+        (group_size, qzeros.is_none())
     };
 
     if let Some(ref zeros) = qzeros_words {
@@ -265,7 +322,7 @@ fn build_layer(
 
     let quant_cfg = QuantizationConfig {
         group_size,
-        symmetric: false,
+        symmetric,
         nibble_map,
     };
 
@@ -324,57 +381,53 @@ fn read_f16_values(data: &[u8]) -> Result<Vec<f32>> {
 }
 
 fn extract_nibble_map(
-    metadata: Option<&std::collections::HashMap<String, String>>,
+    metadata: Option<&HashMap<String, String>>,
     layer_name: &str,
 ) -> Option<[u8; 8]> {
     let meta = metadata?;
-    let mut candidates = Vec::new();
-    let keys = [
+
+    let layer_keys = [
         format!("{layer_name}.pack_order"),
         format!("{layer_name}.nibble_map"),
         format!("{layer_name}.nibble_order"),
         format!("{layer_name}.order"),
-        "pack_order".to_string(),
-        "nibble_map".to_string(),
     ];
-    for key in &keys {
-        if let Some(value) = meta.get(key) {
+    let global_keys = ["pack_order", "nibble_map"];
+
+    let mut keys_to_check = Vec::new();
+    for key in &layer_keys {
+        keys_to_check.push(key.as_str());
+    }
+    keys_to_check.extend_from_slice(&global_keys);
+
+    if let Some(Ok(list)) = search_for_metadata::<Vec<u8>>(meta, &keys_to_check) {
+        if let Some(array) = slice_to_array(&list) {
+            if is_valid_permutation(&array) {
+                return Some(if keys_to_check.iter().any(|k| k.contains("pack")) {
+                    invert_permutation(array)
+                } else {
+                    array
+                });
+            }
+        }
+    }
+
+    // Fallback for string-based permutations
+    for key in &keys_to_check {
+        if let Some(value) = meta.get(*key) {
             if let Some(permutation) = parse_permutation(value) {
-                return Some(if key.contains("pack") {
-                    invert_permutation(permutation)
-                } else {
-                    permutation
-                });
+                if is_valid_permutation(&permutation) {
+                    return Some(if key.contains("pack") {
+                        invert_permutation(permutation)
+                    } else {
+                        permutation
+                    });
+                }
             }
         }
     }
 
-    for (key, value) in meta.iter() {
-        if !key.contains(layer_name) {
-            continue;
-        }
-        if let Some(permutation) = parse_permutation(value) {
-            candidates.push(if key.contains("pack") {
-                invert_permutation(permutation)
-            } else {
-                permutation
-            });
-            continue;
-        }
-        if let Ok(Value::String(inner)) = serde_json::from_str::<Value>(value) {
-            if let Some(permutation) = parse_permutation(&inner) {
-                candidates.push(if key.contains("pack") {
-                    invert_permutation(permutation)
-                } else {
-                    permutation
-                });
-            }
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|perm| is_valid_permutation(perm))
+    None
 }
 
 fn parse_permutation(value: &str) -> Option<[u8; 8]> {
@@ -431,4 +484,28 @@ fn is_valid_permutation(order: &[u8; 8]) -> bool {
         seen[value as usize] = true;
     }
     true
+}
+
+fn search_for_metadata<'a, T>(
+    metadata: &'a HashMap<String, String>,
+    keys: &[&str],
+) -> Option<Result<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    for key in keys {
+        if let Some(value) = metadata.get(*key) {
+            // Try to parse directly
+            if let Ok(parsed) = serde_json::from_str(value) {
+                return Some(Ok(parsed));
+            }
+            // If that fails, try to parse from a JSON string within the string
+            if let Ok(inner_value) = serde_json::from_str::<String>(value) {
+                if let Ok(parsed) = serde_json::from_str(&inner_value) {
+                    return Some(Ok(parsed));
+                }
+            }
+        }
+    }
+    None
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -115,7 +115,11 @@ struct Args {
 
 enum ModelSelection {
     Random,
-    Awq { path: PathBuf, origin: String, repo_id: Option<String> },
+    Awq {
+        paths: Vec<PathBuf>,
+        origin: String,
+        repo_id: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -140,15 +144,19 @@ fn main() -> Result<()> {
                 None,
             )
         }
-        ModelSelection::Awq { path, origin, repo_id } => {
+        ModelSelection::Awq {
+            paths,
+            origin,
+            repo_id,
+        } => {
             println!("🔧 Loading model from disk...");
-            let (model, hidden, depth, layer_names) = build_awq_model(&path)?;
+            let (model, hidden, depth, layer_names) = build_awq_model(&paths)?;
             println!("✓ Model loaded successfully\n");
             (
                 Arc::new(model),
                 hidden,
                 depth,
-                format!("{origin} ({})", path.display()),
+                format!("{origin} ({} files)", paths.len()),
                 layer_names,
                 repo_id,
             )
@@ -263,12 +271,16 @@ fn resolve_model_selection(args: &Args) -> Result<ModelSelection> {
     if let Some(model_arg) = &args.model {
         // Check if it's a HuggingFace URL
         if let Some(repo_id) = parse_huggingface_url(model_arg) {
-            let (path, origin) = download_hf_checkpoint(&repo_id, args)?;
-            return Ok(ModelSelection::Awq { path, origin, repo_id: Some(repo_id) });
+            let (paths, origin) = download_hf_checkpoint(&repo_id, args)?;
+            return Ok(ModelSelection::Awq {
+                paths,
+                origin,
+                repo_id: Some(repo_id),
+            });
         } else {
             // Treat as file path
             return Ok(ModelSelection::Awq {
-                path: PathBuf::from(model_arg),
+                paths: vec![PathBuf::from(model_arg)],
                 origin: String::from("local checkpoint"),
                 repo_id: None,
             });
@@ -276,8 +288,12 @@ fn resolve_model_selection(args: &Args) -> Result<ModelSelection> {
     }
 
     if let Some(repo_id) = &args.hf_repo {
-        let (path, origin) = download_hf_checkpoint(repo_id, args)?;
-        return Ok(ModelSelection::Awq { path, origin, repo_id: Some(repo_id.clone()) });
+        let (paths, origin) = download_hf_checkpoint(repo_id, args)?;
+        return Ok(ModelSelection::Awq {
+            paths,
+            origin,
+            repo_id: Some(repo_id.clone()),
+        });
     }
 
     Ok(ModelSelection::Random)
@@ -310,8 +326,8 @@ fn parse_huggingface_url(s: &str) -> Option<String> {
     None
 }
 
-fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
-    let awq = load_awq_model(path)?;
+fn build_awq_model(paths: &[PathBuf]) -> Result<(Model, usize, usize, Vec<String>)> {
+    let awq = load_awq_model(paths)?;
     let total_layers = awq.depth();
     let all_layer_names = awq
         .layers()
@@ -353,17 +369,17 @@ fn build_awq_model(path: &Path) -> Result<(Model, usize, usize, Vec<String>)> {
     Ok((model, hidden_size, total_layers, all_layer_names))
 }
 
-fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String)> {
+fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(Vec<PathBuf>, String)> {
     let revision = args
         .revision
         .clone()
         .unwrap_or_else(|| String::from("main"));
-    let filename = args
+    let hf_file = args
         .hf_file
         .clone()
         .unwrap_or_else(|| String::from("model.safetensors"));
 
-    println!("📦 Downloading from HuggingFace: {}/{}", repo_id, filename);
+    println!("📦 Downloading from HuggingFace: {}", repo_id);
     println!("   Revision: {}", revision);
 
     let cache = resolve_cache_dir(args)?;
@@ -387,24 +403,60 @@ fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(PathBuf, String
             println!("   Fetching: {}", sibling.rfilename);
             repo.get(&sibling.rfilename)?;
         }
+        println!("✓ Download complete\n");
 
+        // After downloading, find all the .safetensors files
         let repo_dir = cache
             .join(repo_spec.folder_name())
             .join("snapshots")
             .join(&info.sha);
-        let full_path = repo_dir.join(&filename);
-        if !full_path.exists() {
-            bail!("{repo_id} revision {revision} did not contain expected file {filename}");
+
+        let mut safetensor_files = Vec::new();
+        for entry in fs::read_dir(repo_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
+                safetensor_files.push(path);
+            }
         }
+
+        if safetensor_files.is_empty() {
+            bail!("no .safetensors files found in {repo_id} revision {revision}");
+        }
+
+        // Sort for deterministic order
+        safetensor_files.sort();
+
         let origin = format!("{repo_id}@{revision} (full repo)");
-        println!("✓ Download complete\n");
-        Ok((full_path, origin))
+        Ok((safetensor_files, origin))
     } else {
-        println!("   Fetching model file...");
-        let path = repo.get(&filename)?;
-        let origin = format!("{repo_id}/{filename}@{revision}");
+        // Download a single file, or if a sharded model, download all shards
+        println!("   Checking for sharded model...");
+        let info = repo.info()?;
+        let is_sharded = info
+            .siblings
+            .iter()
+            .any(|s| s.rfilename.ends_with(".safetensors") && s.rfilename.contains("-of-"));
+
+        let mut paths = Vec::new();
+        if is_sharded {
+            println!("   Sharded model detected, downloading all .safetensors files...");
+            for sibling in info.siblings {
+                if sibling.rfilename.ends_with(".safetensors") {
+                    println!("   Fetching: {}", sibling.rfilename);
+                    paths.push(repo.get(&sibling.rfilename)?);
+                }
+            }
+            // Sort for deterministic order
+            paths.sort();
+        } else {
+            println!("   Fetching model file: {}", hf_file);
+            paths.push(repo.get(&hf_file)?);
+        }
+
+        let origin = format!("{repo_id}@{revision}");
         println!("✓ Download complete\n");
-        Ok((path, origin))
+        Ok((paths, origin))
     }
 }
 
