@@ -6,9 +6,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use half::f16;
 use safetensors::tensor::TensorView;
 use safetensors::{Dtype, SafeTensors};
-
 use serde::Deserialize;
+use tokenizers::Tokenizer;
 
+use crate::model::{Dense, Model, ModelConfig};
 use crate::quant::{QuantizationConfig, QuantizedLinear};
 
 const AWQ_NIBBLE_MAP: [u8; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
@@ -29,18 +30,40 @@ pub struct AwqLayer {
 #[derive(Debug, Clone)]
 pub struct AwqModel {
     layers: Vec<AwqLayer>,
+    pub embed_tokens: Dense,
+    pub lm_head: Dense,
+    pub tokenizer: Tokenizer,
+    pub config: ModelConfig,
+}
+
+impl Model for AwqModel {
+    fn layers(&self) -> Vec<QuantizedLinear> {
+        self.layers.iter().map(|l| l.linear.clone()).collect()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl AwqModel {
-    pub fn new(layers: Vec<AwqLayer>) -> Result<Self> {
+    pub fn new(
+        layers: Vec<AwqLayer>,
+        embed_tokens: Dense,
+        lm_head: Dense,
+        tokenizer: Tokenizer,
+        config: ModelConfig,
+    ) -> Result<Self> {
         if layers.is_empty() {
             bail!("AWQ model did not contain any quantized layers");
         }
-        Ok(Self { layers })
-    }
-
-    pub fn layers(&self) -> &[AwqLayer] {
-        &self.layers
+        Ok(Self {
+            layers,
+            embed_tokens,
+            lm_head,
+            tokenizer,
+            config,
+        })
     }
 
     pub fn into_layers(self) -> Vec<AwqLayer> {
@@ -48,39 +71,11 @@ impl AwqModel {
     }
 
     pub fn hidden_size(&self) -> Option<usize> {
-        // For transformer models, we need to find the actual hidden_size by looking at
-        // specific layer types. The layers are stored in alphabetical order, so we can't
-        // just use the first layer.
-        //
-        // Strategy: Look for attention q_proj, k_proj, or v_proj layers, which take
-        // hidden_size as input. Or look for down_proj layers which output hidden_size.
-        for layer in &self.layers {
-            if layer.name.contains(".q_proj")
-                || layer.name.contains(".k_proj")
-                || layer.name.contains(".v_proj") {
-                // These layers take hidden_size as input
-                return Some(layer.linear.cols());
-            }
-        }
-
-        // Fallback: look for down_proj which outputs hidden_size
-        for layer in &self.layers {
-            if layer.name.contains(".down_proj") {
-                // down_proj outputs hidden_size
-                return Some(layer.linear.rows());
-            }
-        }
-
-        // Last resort: use the first layer's input dimension
-        self.layers.first().map(|layer| layer.linear.cols())
+        Some(self.config.hidden_size)
     }
 
     pub fn depth(&self) -> usize {
         self.layers.len()
-    }
-
-    pub fn into_quantized_layers(self) -> Vec<QuantizedLinear> {
-        self.layers.into_iter().map(|layer| layer.linear).collect()
     }
 }
 
@@ -95,6 +90,20 @@ pub fn load_awq_model(paths: &[PathBuf]) -> Result<AwqModel> {
     if paths.is_empty() {
         bail!("no safetensors files provided");
     }
+
+    // Find config.json and tokenizer.json in the same directory
+    let parent_dir = paths[0]
+        .parent()
+        .ok_or_else(|| anyhow!("failed to get parent directory of model file"))?;
+    let config_path = parent_dir.join("config.json");
+    let tokenizer_path = parent_dir.join("tokenizer.json");
+
+    let config: ModelConfig = serde_json::from_str(
+        &fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read config.json at {:?}", config_path))?,
+    )?;
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow!("failed to load tokenizer: {}", e))?;
 
     // Read all files into memory first to manage lifetimes
     let mut loaded_data = Vec::new();
@@ -113,7 +122,6 @@ pub fn load_awq_model(paths: &[PathBuf]) -> Result<AwqModel> {
     for (i, bytes) in loaded_data.iter().enumerate() {
         eprintln!("   Parsing safetensors file ({}/{})", i + 1, paths.len());
 
-        // Read metadata from the file bytes
         let (_, file_metadata) = SafeTensors::read_metadata(bytes)
             .with_context(|| format!("failed to parse header of {:?}", paths[i]))?;
         if let Some(meta_map) = file_metadata.metadata() {
@@ -124,11 +132,9 @@ pub fn load_awq_model(paths: &[PathBuf]) -> Result<AwqModel> {
             }
         }
 
-        // Deserialize the full tensor set
         let tensors = SafeTensors::deserialize(bytes)
             .with_context(|| format!("failed to parse safetensors file {:?}", paths[i]))?;
 
-        // Find all the quantized layer components
         for name in tensors.names() {
             if let Some(prefix) = name.strip_suffix(".qweight") {
                 entries.entry(prefix.to_string()).or_default().qweight = Some(name.to_string());
@@ -152,15 +158,12 @@ pub fn load_awq_model(paths: &[PathBuf]) -> Result<AwqModel> {
         bail!("no AWQ tensors were found in the provided files");
     }
 
+    let embed_tokens = load_dense_tensor(&tensors_map, "model.embed_tokens")?;
+    let lm_head = load_dense_tensor(&tensors_map, "lm_head")?;
+
     eprintln!("   Processing {} quantized layers...", entries.len());
     let mut layers = Vec::new();
-    let total_layers = entries.len();
-    let mut processed = 0;
     for (base, entry) in entries {
-        processed += 1;
-        if processed % 10 == 0 || processed == total_layers {
-            eprintln!("   [{}/{}] Processing layers...", processed, total_layers);
-        }
         let qweight_name = entry
             .qweight
             .ok_or_else(|| anyhow!("layer {base} is missing qweight tensor"))?;
@@ -196,7 +199,30 @@ pub fn load_awq_model(paths: &[PathBuf]) -> Result<AwqModel> {
         });
     }
 
-    AwqModel::new(layers)
+    AwqModel::new(layers, embed_tokens, lm_head, tokenizer, config)
+}
+
+fn load_dense_tensor(
+    tensors_map: &HashMap<String, TensorView>,
+    name: &str,
+) -> Result<Dense> {
+    let weight_name = format!("{}.weight", name);
+    let bias_name = format!("{}.bias", name);
+
+    let weight_tensor = tensors_map
+        .get(&weight_name)
+        .ok_or_else(|| anyhow!("tensor {} not found", weight_name))?;
+
+    let weight_values = read_scales(weight_tensor)?;
+    let (rows, cols) = (weight_tensor.shape()[0], weight_tensor.shape()[1]);
+
+    let bias_values = if let Some(bias_tensor) = tensors_map.get(&bias_name) {
+        Some(read_scales(bias_tensor)?)
+    } else {
+        None
+    };
+
+    Dense::new(weight_values, bias_values, rows, cols)
 }
 
 fn build_layer(

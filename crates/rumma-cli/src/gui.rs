@@ -3,7 +3,7 @@ use eframe::{
     egui::{self, CentralPanel, ScrollArea, TextEdit, TopBottomPanel},
     App, Frame,
 };
-use rumma_core::Model;
+use rumma_core::AwqModel;
 use std::{
     sync::{mpsc, Arc},
     thread,
@@ -11,7 +11,7 @@ use std::{
 
 pub enum GuiMessage {
     Status(String),
-    Loaded(Result<Arc<Model>>),
+    Loaded(Result<Arc<AwqModel>>),
 }
 
 pub struct RummaApp {
@@ -20,7 +20,7 @@ pub struct RummaApp {
     pub rx: mpsc::Receiver<GuiMessage>,
     pub tx: mpsc::Sender<GuiMessage>,
     pub is_loading: bool,
-    pub model: Option<Arc<Model>>,
+    pub model: Option<Arc<AwqModel>>,
 }
 
 impl Default for RummaApp {
