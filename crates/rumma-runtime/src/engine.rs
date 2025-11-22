@@ -18,15 +18,15 @@ pub struct DecodeOutput {
 }
 
 pub struct Engine {
-    model: Arc<Model>,
+    model: Arc<dyn Model>,
     cache: PagedKvCache,
     scheduler: Scheduler,
     graphs: GraphRegistry,
 }
 
 impl Engine {
-    pub fn new(model: Arc<Model>) -> Self {
-        let hidden = model.hidden_size();
+    pub fn new(model: Arc<dyn Model>) -> Self {
+        let hidden = model.layers()[0].cols();
         Self {
             model,
             cache: PagedKvCache::new(hidden),
@@ -49,7 +49,7 @@ impl Engine {
 
     pub fn prefill_batch(&mut self, handle: &BatchHandle, inputs: &[f32]) -> Result<()> {
         let batch = handle.sequence_ids().len();
-        let hidden = self.model.hidden_size();
+        let hidden = self.model.layers()[0].cols();
         if inputs.len() != batch * hidden {
             return Err(anyhow!(
                 "prefill expects {} elements, received {}",
@@ -58,7 +58,7 @@ impl Engine {
             ));
         }
         let mut activations = inputs.to_vec();
-        for layer in self.model.layers() {
+        for layer in &self.model.layers() {
             let mut next = gemm_prefill(layer, &activations, batch)?;
             relu_inplace(&mut next);
             activations = next;
@@ -73,7 +73,7 @@ impl Engine {
     }
 
     pub fn decode_step(&mut self, sequence_id: u64, input: &[f32]) -> Result<DecodeOutput> {
-        let hidden = self.model.hidden_size();
+        let hidden = self.model.layers()[0].cols();
         if input.len() != hidden {
             return Err(anyhow!(
                 "decode expects {} elements, received {}",
@@ -82,7 +82,7 @@ impl Engine {
             ));
         }
         let mut state = input.to_vec();
-        for layer in self.model.layers() {
+        for layer in &self.model.layers() {
             let mut next = gemv_decode(layer, &state)?;
             relu_inplace(&mut next);
             state = next;

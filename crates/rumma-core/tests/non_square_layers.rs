@@ -1,4 +1,4 @@
-use rumma_core::{Model, QuantizationConfig, QuantizedLinear};
+use rumma_core::{GenericModel, QuantizationConfig, QuantizedLinear};
 
 #[test]
 fn model_accepts_non_square_layers_that_chain() {
@@ -22,10 +22,7 @@ fn model_accepts_non_square_layers_that_chain() {
     assert_eq!(layer2.rows(), 128);
 
     // Create model - should succeed since layers chain properly
-    let model = Model::new(vec![layer1, layer2]).unwrap();
-
-    // Verify hidden_size is the output of the last layer
-    assert_eq!(model.hidden_size(), 128);
+    let _model = GenericModel::with_hidden_size(vec![layer1, layer2], 128).unwrap();
 }
 
 #[test]
@@ -43,10 +40,7 @@ fn model_accepts_non_chaining_layers() {
     let layer2 = QuantizedLinear::from_dense(128, 128, &layer2_weights, &cfg).unwrap();
 
     // Create model - should succeed (validation removed to support AWQ models)
-    let model = Model::new(vec![layer1, layer2]).unwrap();
-
-    // hidden_size is the output of the last layer
-    assert_eq!(model.hidden_size(), 128);
+    let _model = GenericModel::with_hidden_size(vec![layer1, layer2], 128).unwrap();
 }
 
 #[test]
@@ -60,6 +54,5 @@ fn model_accepts_square_layers() {
     let layer2_weights = vec![0.01f32; 128 * 128];
     let layer2 = QuantizedLinear::from_dense(128, 128, &layer2_weights, &cfg).unwrap();
 
-    let model = Model::new(vec![layer1, layer2]).unwrap();
-    assert_eq!(model.hidden_size(), 128);
+    let _model = GenericModel::with_hidden_size(vec![layer1, layer2], 128).unwrap();
 }

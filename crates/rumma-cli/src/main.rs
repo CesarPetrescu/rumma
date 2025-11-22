@@ -5,16 +5,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueHint};
 use dirs::cache_dir;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use tokenizers::Tokenizer;
-
-use rumma_core::{load_awq_model, Model, ModelBuilder, QuantizationConfig};
+use rumma_core::{load_awq_model, AwqModel, Model, ModelBuilder, QuantizationConfig};
 use rumma_runtime::Engine;
+
+#[cfg(feature = "gui")]
+mod gui;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "rumma demo CLI", long_about = None)]
@@ -111,6 +112,9 @@ struct Args {
         help = "Enter interactive chat mode instead of running benchmark"
     )]
     interactive: bool,
+
+    #[arg(long, help = "Launch the application in GUI mode")]
+    gui: bool,
 }
 
 enum ModelSelection {
@@ -122,21 +126,72 @@ enum ModelSelection {
     },
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+#[cfg(feature = "gui")]
+use std::sync::mpsc;
+
+#[cfg(feature = "gui")]
+pub fn resolve_and_load_model(
+    repo_id: &str,
+    status_tx: Option<mpsc::Sender<gui::GuiMessage>>,
+) -> Result<AwqModel> {
+    // This function will be a stripped-down version of the CLI's model loading
+    // It needs to be callable from the GUI thread.
+
+    let mut args = Args::parse_from(Vec::<String>::new());
+    args.hf_repo = Some(repo_id.to_string());
+
     let selection = resolve_model_selection(&args)?;
 
-    let (model, hidden_size, depth, origin, awq_layers, repo_id) = match selection {
+    let model = match selection {
         ModelSelection::Random => {
-            let quant_cfg = QuantizationConfig {
-                group_size: args.group_size,
-                symmetric: true,
-                nibble_map: [0, 1, 2, 3, 4, 5, 6, 7],
-            };
+            bail!("Random model not supported in GUI mode");
+        }
+        ModelSelection::Awq { paths, .. } => {
+            if let Some(tx) = &status_tx {
+                tx.send(gui::GuiMessage::Status(
+                    "Loading model from disk...".to_string(),
+                ))
+                .unwrap();
+            }
+            let model = build_awq_model(&paths)?;
+            if let Some(tx) = &status_tx {
+                tx.send(gui::GuiMessage::Status(
+                    "Model loaded successfully.".to_string(),
+                ))
+                .unwrap();
+            }
+            model
+        }
+    };
+    Ok(model)
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.gui {
+        #[cfg(feature = "gui")]
+        return gui::run().map_err(|e| anyhow::anyhow!("GUI Error: {}", e));
+        #[cfg(not(feature = "gui"))]
+        bail!("GUI feature is not enabled.");
+    }
+
+    let selection = resolve_model_selection(&args)?;
+
+    let (model, hidden_size, depth, origin, awq_layers, repo_id): (
+        Arc<dyn Model>,
+        usize,
+        usize,
+        String,
+        Vec<String>,
+        Option<String>,
+    ) = match selection {
+        ModelSelection::Random => {
+            let quant_cfg = QuantizationConfig::default();
             let builder = ModelBuilder::new(args.hidden_size, args.layers, quant_cfg);
             let model = builder.build_random(args.seed)?;
             (
-                Arc::new(model),
+                Arc::new(model) as Arc<dyn Model>,
                 args.hidden_size,
                 args.layers,
                 String::from("random demo weights"),
@@ -150,10 +205,18 @@ fn main() -> Result<()> {
             repo_id,
         } => {
             println!("🔧 Loading model from disk...");
-            let (model, hidden, depth, layer_names) = build_awq_model(&paths)?;
+            let awq_model = build_awq_model(&paths)?;
+            let hidden = awq_model.config.hidden_size;
+        let depth = awq_model.depth();
+            let layer_names = awq_model
+            .clone()
+            .into_layers()
+            .into_iter()
+            .map(|l| l.name)
+                .collect();
             println!("✓ Model loaded successfully\n");
             (
-                Arc::new(model),
+                Arc::new(awq_model) as Arc<dyn Model>,
                 hidden,
                 depth,
                 format!("{origin} ({} files)", paths.len()),
@@ -180,13 +243,14 @@ fn main() -> Result<()> {
 
     // Handle interactive mode
     if args.interactive {
-        if let Some(repo) = repo_id {
+        if repo_id.is_some() {
             println!("\n🤖 Entering interactive chat mode...\n");
-
-            // Download tokenizer
-            let tokenizer = download_tokenizer(&repo, &args)?;
-
-            run_interactive_mode(model, hidden_size, &tokenizer)?;
+            let awq_model = model
+                .as_any()
+                .downcast_ref::<AwqModel>()
+                .cloned()
+                .context("failed to downcast model to AwqModel")?;
+            run_interactive_mode(awq_model)?;
             return Ok(());
         } else {
             bail!("Interactive mode requires a HuggingFace model (use --model with a HuggingFace URL)");
@@ -326,47 +390,8 @@ fn parse_huggingface_url(s: &str) -> Option<String> {
     None
 }
 
-fn build_awq_model(paths: &[PathBuf]) -> Result<(Model, usize, usize, Vec<String>)> {
-    let awq = load_awq_model(paths)?;
-    let total_layers = awq.depth();
-    let all_layer_names = awq
-        .layers()
-        .iter()
-        .map(|layer| layer.name.clone())
-        .collect::<Vec<_>>();
-
-    // Get the hidden_size from the AWQ model before consuming it
-    let hidden_size = awq.hidden_size()
-        .context("failed to determine hidden_size from AWQ model")?;
-
-    // Filter layers to only include those that can be chained sequentially
-    // (i.e., layers where BOTH input and output dimensions match hidden_size)
-    // This allows the Engine to process AWQ models even though they contain
-    // layers with different dimensions that aren't meant to be chained.
-    // We filter out MLP layers (gate_proj, up_proj, down_proj) which have
-    // intermediate_size dimensions, keeping only attention projections.
-    let awq_layers = awq.into_layers();
-    let mut filtered_layers = Vec::new();
-    let mut filtered_names = Vec::new();
-
-    for layer in awq_layers {
-        if layer.linear.cols() == hidden_size && layer.linear.rows() == hidden_size {
-            filtered_names.push(layer.name.clone());
-            filtered_layers.push(layer.linear);
-        }
-    }
-
-    eprintln!("   Filtered to {} chainable layers (from {} total)",
-              filtered_layers.len(), total_layers);
-
-    if filtered_layers.is_empty() {
-        bail!("no layers with input dimension matching hidden_size={}", hidden_size);
-    }
-
-    // Create model with explicit hidden_size (AWQ models cannot infer this from layer dims)
-    let model = Model::with_hidden_size(filtered_layers, hidden_size)?;
-
-    Ok((model, hidden_size, total_layers, all_layer_names))
+fn build_awq_model(paths: &[PathBuf]) -> Result<AwqModel> {
+    load_awq_model(paths)
 }
 
 fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(Vec<PathBuf>, String)> {
@@ -460,45 +485,21 @@ fn download_hf_checkpoint(repo_id: &str, args: &Args) -> Result<(Vec<PathBuf>, S
     }
 }
 
-fn download_tokenizer(repo_id: &str, args: &Args) -> Result<Tokenizer> {
-    let revision = args
-        .revision
-        .clone()
-        .unwrap_or_else(|| String::from("main"));
-
-    println!("📝 Downloading tokenizer from HuggingFace: {}", repo_id);
-
-    let cache = resolve_cache_dir(args)?;
-    let mut builder = ApiBuilder::new();
-    if let Some(token) = args.hf_token.clone() {
-        builder = builder.with_token(Some(token));
-    }
-    builder = builder.with_cache_dir(cache);
-    let api = builder.build()?;
-
-    let repo_spec = Repo::with_revision(repo_id.to_string(), RepoType::Model, revision.clone());
-    let repo = api.repo(repo_spec);
-
-    let tokenizer_path = repo.get("tokenizer.json")?;
-    println!("✓ Tokenizer download complete\n");
-
-    Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {}", e))
-}
-
-fn run_interactive_mode(model: Arc<Model>, hidden_size: usize, tokenizer: &Tokenizer) -> Result<()> {
-    let layer_count = model.layers().len();
-
+fn run_interactive_mode(model: AwqModel) -> Result<()> {
     println!("═══════════════════════════════════════════════════════════");
     println!("  Welcome to Rumma Interactive Chat!");
     println!("═══════════════════════════════════════════════════════════");
     println!();
     println!("Type your message and press Enter to chat.");
     println!("Type 'quit' or 'exit' to leave.\n");
-    println!("Model: hidden_size={} layers={}", hidden_size, layer_count);
+    println!(
+        "Model: hidden_size={} layers={}",
+        model.config.hidden_size,
+        model.layers().len()
+    );
     println!("═══════════════════════════════════════════════════════════\n");
 
-    let mut engine = Engine::new(model);
+    let mut engine = Engine::new(Arc::new(model.clone()) as Arc<dyn Model>);
     engine.capture_decode_graph();
 
     loop {
@@ -521,18 +522,16 @@ fn run_interactive_mode(model: Arc<Model>, hidden_size: usize, tokenizer: &Token
         }
 
         // Tokenize input
-        let encoding = tokenizer
+        let encoding = model
+            .tokenizer
             .encode(input, false)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {}", e))?;
         let token_ids = encoding.get_ids();
 
-        println!("\n[DEBUG] Tokenized input:");
-        println!("  Tokens: {:?}", &token_ids[..token_ids.len().min(10)]);
-        println!("  Token count: {}", token_ids.len());
-
         // Generate response
-        println!("\nAssistant: ");
-        let response = generate_response(&mut engine, hidden_size, layer_count, token_ids, tokenizer)?;
+        print!("\nAssistant: ");
+        io::stdout().flush()?;
+        let response = generate_response(&mut engine, Arc::new(model.clone()), token_ids)?;
         println!("{}\n", response);
         println!("───────────────────────────────────────────────────────────\n");
     }
@@ -541,38 +540,97 @@ fn run_interactive_mode(model: Arc<Model>, hidden_size: usize, tokenizer: &Token
 }
 
 fn generate_response(
-    _engine: &mut Engine,
-    _hidden_size: usize,
-    layer_count: usize,
+    engine: &mut Engine,
+    model: Arc<AwqModel>,
     input_tokens: &[u32],
-    _tokenizer: &Tokenizer,
 ) -> Result<String> {
-    // NOTE: This is a simplified implementation that demonstrates the inference flow.
-    // A complete implementation would need:
-    // 1. Embedding layer to convert token_ids -> hidden states
-    // 2. LM head to convert final hidden states -> logits over vocabulary
-    // 3. Proper sampling strategy (temperature, top-k, top-p)
+    let mut generated_tokens = Vec::new();
 
-    println!("[INFO] Running inference (simplified demonstration)...");
-    println!("[INFO] In a complete implementation, we would:");
-    println!("  1. Convert tokens to embeddings using the model's embedding layer");
-    println!("  2. Run the transformer layers (this is what rumma does)");
-    println!("  3. Convert final hidden states to vocabulary logits using LM head");
-    println!("  4. Sample tokens and decode back to text");
-    println!();
-    println!("[LIMITATION] The current rumma engine works with hidden states directly,");
-    println!("             not with embeddings and LM heads. These components need to be");
-    println!("             added to support full text generation.");
-    println!();
+    // Prefill
+    let mut input_embeddings = Vec::new();
+    for &token in input_tokens {
+        let embedding = model.embed_tokens.weight
+            [token as usize * model.config.hidden_size..]
+            .iter()
+            .take(model.config.hidden_size)
+            .cloned()
+            .collect::<Vec<_>>();
+        input_embeddings.extend(embedding);
+    }
 
-    // For now, return a helpful message
-    Ok(format!(
-        "I received your input ({} tokens), but full text generation is not yet implemented.\n\
-         The rumma engine successfully processes tensor operations through {} transformer layers,\n\
-         but it needs embedding and LM head support for complete text-to-text inference.",
-        input_tokens.len(),
-        layer_count
-    ))
+    let batch_handle = {
+        let scheduler = engine.scheduler();
+        scheduler.register_batch(1)
+    };
+    engine.prefill_batch(&batch_handle, &input_embeddings)?;
+
+    let mut next_input = engine
+        .cached_hidden(batch_handle.sequence_ids()[0])
+        .expect("prefill should populate cache");
+
+    // Decode loop
+    for _ in 0..model.config.vocab_size.min(256) {
+        let output = engine.decode_step(batch_handle.sequence_ids()[0], &next_input)?;
+        let logits = &output.logits;
+
+        // Apply LM head
+        let mut output_logits = vec![0.0; model.config.vocab_size];
+        for i in 0..model.config.vocab_size {
+            let mut logit = 0.0;
+            for j in 0..model.config.hidden_size {
+                logit += logits[j] * model.lm_head.weight[i * model.config.hidden_size + j];
+            }
+            output_logits[i] = logit;
+        }
+
+        // Sample next token
+        let next_token = sample_greedy(&output_logits);
+        generated_tokens.push(next_token as u32);
+
+        // Get embedding for next token
+        next_input = model.embed_tokens.weight
+            [next_token as usize * model.config.hidden_size..]
+            .iter()
+            .take(model.config.hidden_size)
+            .cloned()
+            .collect();
+
+        if next_token == 151668 {
+            // EOS token for Qwen3
+            break;
+        }
+    }
+
+    engine.retire_sequence(batch_handle.sequence_ids()[0]);
+
+    let response = model
+        .tokenizer
+        .decode(&generated_tokens, true)
+        .map_err(|e| anyhow!("failed to decode generated tokens: {}", e))?;
+
+    // Qwen3 uses a <think>...</think> block for reasoning.
+    if let Some(start) = response.find("<think>") {
+        if let Some(end) = response.find("</think>") {
+            let thinking_content = &response[start + 7..end];
+            let final_response = &response[end + 8..];
+            return Ok(format!(
+                "\n\n[Thinking]:\n{}\n\n[Response]:\n{}",
+                thinking_content.trim(),
+                final_response.trim()
+            ));
+        }
+    }
+
+    Ok(response)
+}
+
+fn sample_greedy(logits: &[f32]) -> usize {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 fn resolve_cache_dir(args: &Args) -> Result<PathBuf> {
